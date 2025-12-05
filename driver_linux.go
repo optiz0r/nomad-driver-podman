@@ -30,13 +30,16 @@ func (d *Driver) rootlessMount(task *drivers.TaskConfig, driverConfig *TaskConfi
 	mountDir := fmt.Sprintf("/var/run/user/%d/%s", uid, task.AllocID)
 
 	// The user dir is only accessible by root and the user
-	err = os.Mkdir(mountDir, 755)
+	err = os.Mkdir(mountDir, 0755)
 	if err != nil {
 		return "", fmt.Errorf("failed to create user alloc dir: %w", err)
 	}
 
-	err = syscall.Mount(task.AllocDir, mountDir, "", syscall.MS_BIND, "")
+	// Use MS_REC for recursive bind mount - this captures tmpfs submounts
+	// for secrets that Nomad creates before StartTask() is called
+	err = syscall.Mount(task.AllocDir, mountDir, "", syscall.MS_BIND|syscall.MS_REC, "")
 	if err != nil {
+		os.Remove(mountDir)
 		return "", fmt.Errorf("failed to mount user alloc dir: %w", err)
 	}
 
@@ -73,9 +76,9 @@ func (d *Driver) socketUid(driverConfig *TaskConfig) (int, error) {
 	return os.Getuid(), nil
 }
 
-// this only works on linux
+// uidFromSocket extracts the owner UID from the podman socket path
 func uidFromSocket(path string) (int, error) {
-	path = strings.Replace(path, "unix:/", "/var", 1)
+	path = strings.Replace(path, "unix://", "", 1)
 
 	info, err := os.Stat(path)
 	if err != nil {

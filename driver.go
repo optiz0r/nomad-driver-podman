@@ -751,7 +751,12 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 	createOpts.ContainerSecurityConfig.CapAdd = podmanTaskConfig.CapAdd
 	createOpts.ContainerSecurityConfig.CapDrop = podmanTaskConfig.CapDrop
 	createOpts.ContainerSecurityConfig.SelinuxOpts = podmanTaskConfig.SelinuxOpts
-	createOpts.ContainerSecurityConfig.User = cfg.User
+	// Skip setting User for rootless podman to allow "fake root" inside container.
+	// In rootless mode, container uid 0 maps to the podman socket user on the host.
+	// Passing -u would defeat this and break images expecting to run as root.
+	if !rootless {
+		createOpts.ContainerSecurityConfig.User = cfg.User
+	}
 	createOpts.ContainerSecurityConfig.Privileged = podmanTaskConfig.Privileged
 	createOpts.ContainerSecurityConfig.ReadOnlyFilesystem = podmanTaskConfig.ReadOnlyRootfs
 	createOpts.ContainerSecurityConfig.ApparmorProfile = podmanTaskConfig.ApparmorProfile
