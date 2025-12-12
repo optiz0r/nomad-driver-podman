@@ -136,6 +136,13 @@ var (
 		"readonly_rootfs": hclspec.NewAttr("readonly_rootfs", "bool", false),
 		"userns":          hclspec.NewAttr("userns", "string", false),
 		"shm_size":        hclspec.NewAttr("shm_size", "string", false),
+		// user_squash controls whether to pass the task user to podman.
+		// When true (default), the task's user is passed through (original behavior).
+		// Set to false for rootless "fake root" where container uid 0 maps to socket owner.
+		"user_squash": hclspec.NewDefault(
+			hclspec.NewAttr("user_squash", "bool", false),
+			hclspec.NewLiteral("true"),
+		),
 	})
 )
 
@@ -256,4 +263,5 @@ type TaskConfig struct {
 	UserNS            string             `codec:"userns"`
 	ShmSize           string             `codec:"shm_size"`
 	SecurityOpt       []string           `codec:"security_opt"`
+	UserSquash        bool               `codec:"user_squash"`
 }
