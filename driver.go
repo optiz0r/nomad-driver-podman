@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -143,8 +144,8 @@ type Driver struct {
 
 	pauseContainers map[string]struct{}
 
-	// lastOrphanCleanup tracks when we last cleaned up orphaned mounts
-	lastOrphanCleanup time.Time
+	// cleanupOnce ensures the cleanup goroutine is only started once
+	cleanupOnce sync.Once
 }
 
 // TaskState is the state which is encoded in the handle returned in
@@ -232,8 +233,10 @@ func (d *Driver) SetConfig(cfg *base.Config) error {
 	}
 	d.compute = cfg.AgentConfig.Compute()
 
-	// Clean up any orphaned rootless bind mounts from previous runs
-	d.cleanupOrphanedMounts()
+	// Start background cleanup goroutine for orphaned rootless bind mounts (only once)
+	d.cleanupOnce.Do(func() {
+		go d.runOrphanCleanup()
+	})
 
 	return nil
 }
@@ -351,14 +354,36 @@ func (d *Driver) handleFingerprint(ctx context.Context, ch chan<- *drivers.Finge
 	}
 }
 
-func (d *Driver) buildFingerprint() *drivers.Fingerprint {
-	// Clean up orphaned rootless bind mounts periodically (every 5 minutes)
-	// to avoid running expensive cleanup on every fingerprint cycle
-	if time.Since(d.lastOrphanCleanup) > 5*time.Minute {
+// runOrphanCleanup periodically cleans up orphaned rootless bind mounts.
+// This runs as a dedicated goroutine instead of piggybacking on fingerprinting.
+func (d *Driver) runOrphanCleanup() {
+	// safeCleanup wraps cleanup with panic recovery so the goroutine survives errors
+	safeCleanup := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				d.logger.Error("panic in orphan cleanup", "panic", r)
+			}
+		}()
 		d.cleanupOrphanedMounts()
-		d.lastOrphanCleanup = time.Now()
 	}
 
+	// Initial cleanup on startup
+	safeCleanup()
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-ticker.C:
+			safeCleanup()
+		}
+	}
+}
+
+func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 	attrs := map[string]*pstructs.Attribute{}
 	allClientsAreHealthy := true
 	unhealthyClients := []string{}
@@ -765,10 +790,11 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 	createOpts.ContainerSecurityConfig.CapAdd = podmanTaskConfig.CapAdd
 	createOpts.ContainerSecurityConfig.CapDrop = podmanTaskConfig.CapDrop
 	createOpts.ContainerSecurityConfig.SelinuxOpts = podmanTaskConfig.SelinuxOpts
-	// Skip setting User for rootless podman to allow "fake root" inside container.
-	// In rootless mode, container uid 0 maps to the podman socket user on the host.
-	// Passing -u would defeat this and break images expecting to run as root.
-	if !rootless {
+	// UserSquash controls whether to pass the task user to podman.
+	// When true (default), cfg.User is passed through.
+	// When false, cfg.User is not passed, enabling rootless "fake root" where
+	// container uid 0 maps to the socket owner on the host.
+	if cfg.User != "" && podmanTaskConfig.UserSquash {
 		createOpts.ContainerSecurityConfig.User = cfg.User
 	}
 	createOpts.ContainerSecurityConfig.Privileged = podmanTaskConfig.Privileged
