@@ -716,6 +716,13 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 	if err != nil {
 		return nil, nil, err
 	}
+	if rootlessMountDir != "" && createOpts.LogConfiguration.Driver == "k8s-file" {
+		rootlessDir := &rootlessTaskDir{
+			mountDir: rootlessMountDir,
+			allocDir: cfg.AllocDir,
+		}
+		createOpts.LogConfiguration.Path = rootlessDir.rewritePath(createOpts.LogConfiguration.Path)
+	}
 
 	// Note: we intentionally don't clean up the bind mount on StartTask error.
 	// The mount persists so that Nomad can retry, and rootlessMount() will
