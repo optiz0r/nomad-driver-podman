@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2019, 2025
+// Copyright IBM Corp. 2019, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package main
@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1665,10 +1666,10 @@ func TestPodmanDriver_Caps(t *testing.T) {
 func TestPodmanDriver_SecurityOpt(t *testing.T) {
 	taskCfg := newTaskConfig("", busyboxLongRunningCmd)
 	// add a security_opt
-	taskCfg.SecurityOpt = []string{"no-new-privileges"}
+	taskCfg.SecurityOpt = []string{"label=disable"}
 	inspectData := startDestroyInspect(t, taskCfg, "securityopt")
 	// and compare it
-	must.SliceContains(t, inspectData.HostConfig.SecurityOpt, "no-new-privileges")
+	must.SliceContains(t, inspectData.HostConfig.SecurityOpt, "label=disable")
 }
 
 // check enabled tty option
@@ -2105,6 +2106,177 @@ func TestPodmanDriver_NetworkMode_Task(t *testing.T) {
 	must.StrContains(t, tasklog, "127.0.0.1:6748")
 }
 
+// check ipc_mode configuration is applied to the container. Each mode listed
+// here is reported back verbatim by podman via inspect.
+func TestPodmanDriver_IPCModes(t *testing.T) {
+	ci.Parallel(t)
+
+	testCases := []struct {
+		mode     string
+		expected string
+	}{
+		{mode: "host", expected: "host"},
+		{mode: "private", expected: "private"},
+		{mode: "shareable", expected: "shareable"},
+		{mode: "none", expected: "none"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%s_mode_%s", t.Name(), tc.mode), func(t *testing.T) {
+			taskCfg := newTaskConfig("", busyboxLongRunningCmd)
+			taskCfg.IPCMode = tc.mode
+
+			task := &drivers.TaskConfig{
+				ID:        uuid.Generate(),
+				Name:      fmt.Sprintf("ipc_mode_%s", tc.mode),
+				AllocID:   uuid.Generate(),
+				Resources: createBasicResources(),
+			}
+
+			must.NoError(t, task.EncodeConcreteDriverConfig(&taskCfg))
+
+			d := podmanDriverHarness(t, nil)
+			t.Cleanup(d.MkAllocDir(task, true))
+
+			containerName := BuildContainerName(task)
+			_, _, err := d.StartTask(task)
+			must.NoError(t, err)
+
+			t.Cleanup(func() {
+				_ = d.DestroyTask(task.ID, true)
+			})
+
+			must.NoError(t, d.WaitUntilStarted(task.ID, 20*time.Second))
+
+			inspectData, err := getPodmanDriver(t, d).defaultPodman.ContainerInspect(context.Background(), containerName)
+			must.NoError(t, err)
+			must.Eq(t, tc.expected, inspectData.HostConfig.IpcMode)
+		})
+	}
+}
+
+// let a task join the IPC namespace of another container via ipc_mode=task:.
+// This is the pattern used for NVIDIA MPS, where clients share the IPC
+// namespace (and thus /dev/shm) of the MPS control daemon. We verify the
+// sharing by writing a marker file to /dev/shm in the main task and
+// confirming the sidecar, which joins that IPC namespace, can read it.
+func TestPodmanDriver_IPCMode_Task(t *testing.T) {
+	ci.Parallel(t)
+
+	allocId := uuid.Generate()
+
+	// main task writes a marker into the shared /dev/shm then stays alive
+	mainTaskCfg := newTaskConfig("", []string{
+		"sh",
+		"-c",
+		"echo shared-ipc-ok > /dev/shm/marker && sleep 600",
+	})
+	mainTask := &drivers.TaskConfig{
+		ID:        uuid.Generate(),
+		Name:      "maintask",
+		AllocID:   allocId,
+		Resources: createBasicResources(),
+	}
+	must.NoError(t, mainTask.EncodeConcreteDriverConfig(&mainTaskCfg))
+
+	// sidecar joins the main task's IPC namespace and reads the marker
+	sidecarTaskCfg := newTaskConfig("", []string{
+		"sh",
+		"-c",
+		// give the main task a moment to write the marker
+		"sleep 2 && cat /dev/shm/marker",
+	})
+	sidecarTaskCfg.IPCMode = "task:maintask"
+	sidecarTask := &drivers.TaskConfig{
+		ID:        uuid.Generate(),
+		Name:      "sidecar",
+		AllocID:   allocId,
+		Resources: createBasicResources(),
+	}
+	must.NoError(t, sidecarTask.EncodeConcreteDriverConfig(&sidecarTaskCfg))
+
+	mainHarness := podmanDriverHarness(t, nil)
+	t.Cleanup(mainHarness.MkAllocDir(mainTask, true))
+
+	_, _, err := mainHarness.StartTask(mainTask)
+	must.NoError(t, err)
+	t.Cleanup(func() {
+		_ = mainHarness.DestroyTask(mainTask.ID, true)
+	})
+
+	// ensure the main task is running before the sidecar attempts to join
+	must.NoError(t, mainHarness.WaitUntilStarted(mainTask.ID, 20*time.Second))
+
+	sidecarHarness := podmanDriverHarness(t, nil)
+	t.Cleanup(sidecarHarness.MkAllocDir(sidecarTask, true))
+
+	_, _, err = sidecarHarness.StartTask(sidecarTask)
+	must.NoError(t, err)
+	t.Cleanup(func() {
+		_ = sidecarHarness.DestroyTask(sidecarTask.ID, true)
+	})
+
+	// Attempt to wait
+	waitCh, err := sidecarHarness.WaitTask(context.Background(), sidecarTask.ID)
+	must.NoError(t, err)
+
+	select {
+	case res := <-waitCh:
+		// should have a exitcode=0 result
+		must.True(t, res.Successful(), must.Sprint("expected sidecar task to be successful"))
+	case <-time.After(15 * time.Second):
+		t.Fatalf("Sidecar did not exit in time")
+	}
+
+	// the marker is only visible if the sidecar shares the main task's
+	// IPC namespace (and therefore its /dev/shm)
+	tasklog := readStdoutLog(t, sidecarTask)
+	must.StrContains(t, tasklog, "shared-ipc-ok")
+}
+
+// check that combining shm_size with an ipc_mode that does not own the
+// container's /dev/shm is rejected by StartTask before the container is
+// created. Modes that own /dev/shm (private, shareable) are allowed and
+// covered separately.
+func TestPodmanDriver_IPCMode_ShmSizeConflict(t *testing.T) {
+	ci.Parallel(t)
+
+	testCases := []struct {
+		name    string
+		ipcMode string
+	}{
+		{name: "host", ipcMode: "host"},
+		{name: "none", ipcMode: "none"},
+		{name: "container", ipcMode: "container:somecontainer"},
+		{name: "ns", ipcMode: "ns:/proc/1/ns/ipc"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%s_%s", t.Name(), tc.name), func(t *testing.T) {
+			taskCfg := newTaskConfig("", busyboxLongRunningCmd)
+			taskCfg.IPCMode = tc.ipcMode
+			taskCfg.ShmSize = "64m"
+
+			task := &drivers.TaskConfig{
+				ID:        uuid.Generate(),
+				Name:      fmt.Sprintf("ipc_shm_conflict_%s", tc.name),
+				AllocID:   uuid.Generate(),
+				Resources: createBasicResources(),
+			}
+			must.NoError(t, task.EncodeConcreteDriverConfig(&taskCfg))
+
+			d := podmanDriverHarness(t, nil)
+			t.Cleanup(d.MkAllocDir(task, true))
+
+			_, _, err := d.StartTask(task)
+			must.Error(t, err)
+			must.StrContains(t, err.Error(), "shm_size cannot be used with ipc_mode")
+
+			_ = d.DestroyTask(task.ID, true)
+		})
+	}
+}
+
 // test kill / signal support
 func TestPodmanDriver_SignalTask(t *testing.T) {
 	ci.Parallel(t)
@@ -2238,7 +2410,7 @@ func startDestroyInspectImage(t *testing.T, image string, taskName string) {
 		Resources: createBasicResources(),
 	}
 	driver := getPodmanDriver(t, d)
-	imageID, err := driver.createImage(image, &TaskAuthConfig{}, false, false, driver.defaultPodman, 5*time.Minute, task)
+	imageID, err := driver.createImage(image, &TaskAuthConfig{}, false, false, imagePlatform{}, driver.defaultPodman, 5*time.Minute, task)
 	must.NoError(t, err)
 	must.Eq(t, imageID, inspectData.Image)
 }
@@ -2319,7 +2491,7 @@ insecure = true`
 		// Pull image using our proxy.
 		image := "localhost:5000/quay/busybox:latest"
 		driver := getPodmanDriver(t, d)
-		_, err = driver.createImage(image, &TaskAuthConfig{}, false, true, driver.defaultPodman, 3*time.Second, task)
+		_, err = driver.createImage(image, &TaskAuthConfig{}, false, true, imagePlatform{}, driver.defaultPodman, 3*time.Second, task)
 		resultCh <- err
 	}()
 
@@ -2344,8 +2516,58 @@ func Test_createImage(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		createInspectImage(t, testCase.Image, testCase.Reference)
+		t.Run(testCase.Image, func(t *testing.T) {
+			d := podmanDriverHarness(t, nil)
+			driver := getPodmanDriver(t, d)
+
+			task := &drivers.TaskConfig{
+				ID:        uuid.Generate(),
+				Name:      "inspectImage",
+				AllocID:   uuid.Generate(),
+				Resources: createBasicResources(),
+			}
+
+			idTest, err := driver.createImage(testCase.Image, &TaskAuthConfig{}, false, false, imagePlatform{}, driver.defaultPodman, 5*time.Minute, task)
+			must.NoError(t, err)
+
+			idRef, err := driver.defaultPodman.ImageInspectID(context.Background(), testCase.Reference)
+			must.NoError(t, err)
+			must.Eq(t, idRef, idTest)
+		})
 	}
+}
+
+func Test_createImagePlatform(t *testing.T) {
+	ci.Parallel(t)
+
+	testCases := []struct {
+		Name     string
+		Image    string
+		Platform imagePlatform
+	}{
+		{
+			Name:     "amd64",
+			Image:    "docker.io/library/alpine:latest",
+			Platform: imagePlatform{os: "linux", arch: "amd64"},
+		},
+		{
+			Name:     "arm64",
+			Image:    "docker.io/library/alpine:latest",
+			Platform: imagePlatform{os: "linux", arch: "arm64"},
+		},
+	}
+
+	ids := make(map[string]string, len(testCases))
+	for _, testCase := range testCases {
+		ids[testCase.Name] = createInspectImagePlatform(t, testCase.Image, testCase.Platform)
+	}
+
+	// The platform override must actually take effect: the same image reference
+	// pulled for two different architectures resolves to two different image
+	// IDs. This also exercises the cache-bypass (no force_pull) and the
+	// per-platform singleflight key.
+	must.NotEq(t, ids["amd64"], ids["arm64"],
+		must.Sprint("expected the amd64 and arm64 overrides to resolve to different image IDs"))
 }
 
 func Test_createImageArchives(t *testing.T) {
@@ -2360,13 +2582,15 @@ func Test_createImageArchives(t *testing.T) {
 		return false
 	}
 
-	if doesNotExist("/tmp/oci-archive") || doesNotExist("/tmp/docker-archive") {
-		t.Skip("Skipping image archive test. Missing prepared archive file(s).")
-	}
-
+	// Archives are prepared by .github/machinesetup.sh in /tmp; ARCHIVE_DIR can
+	// override the location for local runs.
 	archiveDir := os.Getenv("ARCHIVE_DIR")
 	if archiveDir == "" {
-		t.Skip("Skipping image archive test. Missing \"ARCHIVE_DIR\" environment variable")
+		archiveDir = "/tmp"
+	}
+
+	if doesNotExist(archiveDir+"/oci-archive") || doesNotExist(archiveDir+"/docker-archive") {
+		t.Skip("Skipping image archive test. Missing prepared archive file(s).")
 	}
 
 	testCases := []struct {
@@ -2375,35 +2599,123 @@ func Test_createImageArchives(t *testing.T) {
 	}{
 		{
 			Image:     fmt.Sprintf("oci-archive:%s/oci-archive", archiveDir),
-			Reference: "docker.io/library/alpine:latest",
+			Reference: "docker.io/library/alpine:3",
 		},
 		{
 			Image:     fmt.Sprintf("docker-archive:%s/docker-archive", archiveDir),
-			Reference: "docker.io/library/alpine:latest",
+			Reference: "docker.io/library/alpine:3",
 		},
 	}
 
 	for _, testCase := range testCases {
-		createInspectImage(t, testCase.Image, testCase.Reference)
+		t.Run(testCase.Image, func(t *testing.T) {
+			d := podmanDriverHarness(t, nil)
+			driver := getPodmanDriver(t, d)
+
+			task := &drivers.TaskConfig{
+				ID:        uuid.Generate(),
+				Name:      "inspectImage",
+				AllocID:   uuid.Generate(),
+				Resources: createBasicResources(),
+			}
+
+			idTest, err := driver.createImage(testCase.Image, &TaskAuthConfig{}, false, false, imagePlatform{}, driver.defaultPodman, 5*time.Minute, task)
+			must.NoError(t, err)
+
+			idRef, err := driver.defaultPodman.ImageInspectID(context.Background(), testCase.Reference)
+			must.NoError(t, err)
+			must.Eq(t, idRef, idTest)
+		})
 	}
 }
 
-func createInspectImage(t *testing.T, image, reference string) {
+func Test_createImageArchivesHTTP(t *testing.T) {
+	ci.Parallel(t)
+
+	doesNotExist := func(filepath string) bool {
+		_, err := os.Stat(filepath)
+		if errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+		must.NoError(t, err)
+		return false
+	}
+
+	// Archives are prepared by .github/machinesetup.sh in /tmp; ARCHIVE_DIR can
+	// override the location for local runs.
+	archiveDir := os.Getenv("ARCHIVE_DIR")
+	if archiveDir == "" {
+		archiveDir = "/tmp"
+	}
+
+	if doesNotExist(archiveDir+"/oci-archive") || doesNotExist(archiveDir+"/docker-archive") {
+		t.Skip("Skipping image archive test. Missing prepared archive file(s).")
+	}
+
+	// Serve the prepared archive files over HTTP so createImage exercises the
+	// download-then-load path instead of reading from disk.
+	server := httptest.NewServer(http.FileServer(http.Dir(archiveDir)))
+	t.Cleanup(server.Close)
+
+	testCases := []struct {
+		Image     string
+		Reference string
+	}{
+		{
+			Image:     fmt.Sprintf("oci-archive:%s/oci-archive", server.URL),
+			Reference: "docker.io/library/alpine:3",
+		},
+		{
+			Image:     fmt.Sprintf("docker-archive:%s/docker-archive", server.URL),
+			Reference: "docker.io/library/alpine:3",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.Image, func(t *testing.T) {
+			d := podmanDriverHarness(t, nil)
+			driver := getPodmanDriver(t, d)
+
+			task := &drivers.TaskConfig{
+				ID:        uuid.Generate(),
+				Name:      "inspectImage",
+				AllocID:   uuid.Generate(),
+				Resources: createBasicResources(),
+			}
+
+			idTest, err := driver.createImage(testCase.Image, &TaskAuthConfig{}, false, false, imagePlatform{}, driver.defaultPodman, 5*time.Minute, task)
+			must.NoError(t, err)
+
+			idRef, err := driver.defaultPodman.ImageInspectID(context.Background(), testCase.Reference)
+			must.NoError(t, err)
+			must.Eq(t, idRef, idTest)
+		})
+	}
+}
+
+func createInspectImagePlatform(t *testing.T, image string, platform imagePlatform) string {
 	d := podmanDriverHarness(t, nil)
 
 	task := &drivers.TaskConfig{
 		ID:        uuid.Generate(),
-		Name:      "inspectImage",
+		Name:      "inspectImagePlatform",
 		AllocID:   uuid.Generate(),
 		Resources: createBasicResources(),
 	}
 	driver := getPodmanDriver(t, d)
-	idTest, err := driver.createImage(image, &TaskAuthConfig{}, false, false, driver.defaultPodman, 5*time.Minute, task)
+	idTest, err := driver.createImage(image, &TaskAuthConfig{}, false, false, platform, driver.defaultPodman, 5*time.Minute, task)
 	must.NoError(t, err)
 
-	idRef, err := driver.defaultPodman.ImageInspectID(context.Background(), reference)
+	// Independently inspect the stored image for the requested platform and
+	// confirm createImage returned that exact image ID. This verifies the
+	// correct platform variant was pulled, not merely that some image with the
+	// given name exists.
+	idRef, err := driver.defaultPodman.ImageInspectIDForPlatform(
+		context.Background(), image, platform.os, platform.arch, platform.variant)
 	must.NoError(t, err)
 	must.Eq(t, idRef, idTest)
+
+	return idTest
 }
 
 func Test_setTaskCpuset(t *testing.T) {
@@ -2522,19 +2834,19 @@ func Test_memoryLimits(t *testing.T) {
 	ci.Parallel(t)
 
 	cases := []struct {
-		name         string
-		memResources drivers.MemoryResources
-		reservation  string
-		expectedHard int64
-		expectedSoft int64
+		name            string
+		memResources    drivers.MemoryResources
+		reservation     string
+		expectedHard    int64
+		expectedReserve int64
 	}{
 		{
 			name: "plain",
 			memResources: drivers.MemoryResources{
 				MemoryMB: 20,
 			},
-			expectedHard: 20 * 1024 * 1024,
-			expectedSoft: 0,
+			expectedHard:    20 * 1024 * 1024,
+			expectedReserve: 0,
 		},
 		{
 			name: "memory oversubscription",
@@ -2542,17 +2854,17 @@ func Test_memoryLimits(t *testing.T) {
 				MemoryMB:    20,
 				MemoryMaxMB: 30,
 			},
-			expectedHard: 30 * 1024 * 1024,
-			expectedSoft: 20 * 1024 * 1024,
+			expectedHard:    30 * 1024 * 1024,
+			expectedReserve: 20 * 1024 * 1024,
 		},
 		{
 			name: "plain but using memory reservations",
 			memResources: drivers.MemoryResources{
 				MemoryMB: 20,
 			},
-			reservation:  "10m",
-			expectedHard: 20 * 1024 * 1024,
-			expectedSoft: 10 * 1024 * 1024,
+			reservation:     "10m",
+			expectedHard:    20 * 1024 * 1024,
+			expectedReserve: 10 * 1024 * 1024,
 		},
 		{
 			name: "oversubscription but with specifying memory reservation",
@@ -2560,9 +2872,9 @@ func Test_memoryLimits(t *testing.T) {
 				MemoryMB:    20,
 				MemoryMaxMB: 30,
 			},
-			reservation:  "10m",
-			expectedHard: 30 * 1024 * 1024,
-			expectedSoft: 10 * 1024 * 1024,
+			reservation:     "10m",
+			expectedHard:    30 * 1024 * 1024,
+			expectedReserve: 10 * 1024 * 1024,
 		},
 		{
 			name: "oversubscription but with specifying high memory reservation",
@@ -2570,29 +2882,39 @@ func Test_memoryLimits(t *testing.T) {
 				MemoryMB:    20,
 				MemoryMaxMB: 30,
 			},
-			reservation:  "25m",
-			expectedHard: 30 * 1024 * 1024,
-			expectedSoft: 20 * 1024 * 1024,
+			reservation:     "25m",
+			expectedHard:    30 * 1024 * 1024,
+			expectedReserve: 20 * 1024 * 1024,
+		},
+		{
+			name: "oversubscription without hard limit",
+			memResources: drivers.MemoryResources{
+				MemoryMB:    20,
+				MemoryMaxMB: -1,
+			},
+			reservation:     "25m",
+			expectedHard:    0,
+			expectedReserve: 20 * 1024 * 1024,
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			hard, soft, err := memoryLimits(c.memResources, c.reservation)
+			hard, reserve, err := memoryLimits(c.memResources, c.reservation)
 			must.NoError(t, err)
 
 			if c.expectedHard > 0 {
-				must.NotNil(t, hard)
+				must.NotNil(t, hard, must.Sprintf("hard limit was nil"))
 				must.Eq(t, c.expectedHard, *hard)
 			} else {
-				must.Nil(t, hard)
+				must.Nil(t, hard, must.Sprintf("hard limit was not nil: %d", hard))
 			}
 
-			if c.expectedSoft > 0 {
-				must.NotNil(t, soft)
-				must.Eq(t, c.expectedSoft, *soft)
+			if c.expectedReserve > 0 {
+				must.NotNil(t, reserve, must.Sprint("reserve was nil"))
+				must.Eq(t, c.expectedReserve, *reserve)
 			} else {
-				must.Nil(t, soft)
+				must.Nil(t, reserve, must.Sprintf("reserve was not nil: %d", reserve))
 			}
 		})
 	}
@@ -2628,6 +2950,83 @@ func Test_parseImage(t *testing.T) {
 		}
 
 	}
+}
+
+func Test_archiveTransportURL(t *testing.T) {
+	ci.Parallel(t)
+
+	testCases := []struct {
+		Name    string
+		Input   string
+		WantURL string
+		WantOK  bool
+	}{
+		{
+			Name:    "oci-archive http",
+			Input:   "oci-archive:http://10.211.55.9:9999/uploads/myhttp.tar",
+			WantURL: "http://10.211.55.9:9999/uploads/myhttp.tar",
+			WantOK:  true,
+		},
+		{
+			Name:    "oci-archive https",
+			Input:   "oci-archive:https://example.com/image.tar",
+			WantURL: "https://example.com/image.tar",
+			WantOK:  true,
+		},
+		{
+			Name:    "docker-archive http",
+			Input:   "docker-archive:http://example.com/image.tar",
+			WantURL: "http://example.com/image.tar",
+			WantOK:  true,
+		},
+		{
+			Name:   "docker-archive local path with tag",
+			Input:  "docker-archive:/tmp/image.tar:latest",
+			WantOK: false,
+		},
+		{
+			Name:   "docker transport url",
+			Input:  "docker://quay.io/repo/busybox:latest",
+			WantOK: false,
+		},
+		{
+			Name:   "plain image name",
+			Input:  "busybox:latest",
+			WantOK: false,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.Name, func(t *testing.T) {
+			gotURL, gotOK := archiveTransportURL(testCase.Input)
+			must.Eq(t, testCase.WantOK, gotOK)
+			must.Eq(t, testCase.WantURL, gotURL)
+		})
+	}
+}
+
+// Test_loadImageFromURL_httpError verifies that a non-200 response from the
+// archive URL produces a clear error before any podman interaction.
+func Test_loadImageFromURL_httpError(t *testing.T) {
+	ci.Parallel(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no such archive", http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+
+	driver, ok := NewPodmanDriver(testlog.HCLogger(t)).(*Driver)
+	must.True(t, ok)
+
+	task := &drivers.TaskConfig{
+		ID:      uuid.Generate(),
+		Name:    "loadImageFromURL",
+		AllocID: uuid.Generate(),
+	}
+
+	_, err := driver.loadImageFromURL(server.URL+"/missing.tar", nil, time.Minute, task)
+	must.ErrorContains(t, err, "404")
+	must.ErrorContains(t, err, "unexpected status")
 }
 
 func Test_namedSocketIsDefault(t *testing.T) {
@@ -2831,6 +3230,20 @@ func TestUserNSConfigParsing(t *testing.T) {
 			expectNamespace: api.Namespace{
 				NSMode: "auto",
 			},
+			expectMapping: &api.IDMappingOptions{
+				UIDMap:         []api.IDMap{},
+				GIDMap:         []api.IDMap{},
+				AutoUserNs:     true,
+				AutoUserNsOpts: api.AutoUserNsOptions{},
+			},
+		},
+		{
+			input:     "made-up-mode",
+			expectErr: `unknown userns mode "made-up-mode"`,
+		},
+		{
+			input:     "auto:unknown=1",
+			expectErr: `invalid userns auto option "unknown"`,
 		},
 		{
 			input: "auto:uidmapping=33:1001:1,gidmapping=34:1002:2,size=3",
@@ -2877,4 +3290,525 @@ func TestUserNSConfigParsing(t *testing.T) {
 		}
 	}
 
+}
+
+func TestResolveContainerIP(t *testing.T) {
+	testCases := []struct {
+		name            string
+		networkSettings *api.InspectNetworkSettings
+		networkName     string
+		expectedIP      string
+	}{
+		{
+			name:            "nil network settings returns empty",
+			networkSettings: nil,
+			networkName:     "default",
+			expectedIP:      "",
+		},
+		{
+			name: "top-level IPAddress is used when present",
+			networkSettings: &api.InspectNetworkSettings{
+				InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+					IPAddress: "10.88.0.100",
+				},
+			},
+			networkName: "default",
+			expectedIP:  "10.88.0.100",
+		},
+		{
+			name: "falls back to named network in per-network map",
+			networkSettings: &api.InspectNetworkSettings{
+				InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+					IPAddress: "",
+				},
+				Networks: map[string]*api.InspectAdditionalNetwork{
+					"testnet6": {
+						InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+							IPAddress: "10.89.2.100",
+						},
+					},
+				},
+			},
+			networkName: "testnet6",
+			expectedIP:  "10.89.2.100",
+		},
+		{
+			name: "falls back to default key in map when top-level empty",
+			networkSettings: &api.InspectNetworkSettings{
+				InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+					IPAddress: "",
+				},
+				Networks: map[string]*api.InspectAdditionalNetwork{
+					"default": {
+						InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+							IPAddress: "10.88.0.77",
+						},
+					},
+				},
+			},
+			networkName: "default",
+			expectedIP:  "10.88.0.77",
+		},
+		{
+			name: "requested network not in map returns empty",
+			networkSettings: &api.InspectNetworkSettings{
+				InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+					IPAddress: "",
+				},
+				Networks: map[string]*api.InspectAdditionalNetwork{
+					"othernet": {
+						InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+							IPAddress: "10.99.0.1",
+						},
+					},
+				},
+			},
+			networkName: "mynet",
+			expectedIP:  "",
+		},
+		{
+			name: "top-level IP takes precedence even with networks map",
+			networkSettings: &api.InspectNetworkSettings{
+				InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+					IPAddress: "10.88.0.100",
+				},
+				Networks: map[string]*api.InspectAdditionalNetwork{
+					"default": {
+						InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+							IPAddress: "10.88.0.200",
+						},
+					},
+				},
+			},
+			networkName: "default",
+			expectedIP:  "10.88.0.100",
+		},
+		{
+			name: "named IPv6-only network falls back to GlobalIPv6Address",
+			networkSettings: &api.InspectNetworkSettings{
+				InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+					IPAddress: "",
+				},
+				Networks: map[string]*api.InspectAdditionalNetwork{
+					"localv6": {
+						InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+							IPAddress:         "",
+							GlobalIPv6Address: "2a01:4f8:c2c:cd3c:fefe::10",
+						},
+					},
+				},
+			},
+			networkName: "localv6",
+			expectedIP:  "2a01:4f8:c2c:cd3c:fefe::10",
+		},
+		{
+			name: "named dual-stack network prefers IPv4 over IPv6",
+			networkSettings: &api.InspectNetworkSettings{
+				InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+					IPAddress: "",
+				},
+				Networks: map[string]*api.InspectAdditionalNetwork{
+					"localv6": {
+						InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+							IPAddress:         "10.89.1.10",
+							GlobalIPv6Address: "2a01:4f8:c2c:cd3c:fefe::10",
+						},
+					},
+				},
+			},
+			networkName: "localv6",
+			expectedIP:  "10.89.1.10",
+		},
+		{
+			name: "top-level IPv6-only falls back to GlobalIPv6Address",
+			networkSettings: &api.InspectNetworkSettings{
+				InspectBasicNetworkConfig: api.InspectBasicNetworkConfig{
+					IPAddress:         "",
+					GlobalIPv6Address: "fd00::42",
+				},
+			},
+			networkName: "default",
+			expectedIP:  "fd00::42",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := resolveContainerIP(tc.networkSettings, tc.networkName)
+			must.Eq(t, tc.expectedIP, result)
+		})
+	}
+}
+
+// TestGetSocketOwner verifies getSocketOwner returns the correct uid/gid
+// for unix sockets and false for non-unix or missing paths.
+func TestGetSocketOwner(t *testing.T) {
+	ci.Parallel(t)
+
+	// Use /tmp to avoid macOS socket path length limit (108 chars)
+	dir, err := os.MkdirTemp("/tmp", "sock-test-*")
+	must.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	sockPath := filepath.Join(dir, "t.sock")
+	listener, err := net.Listen("unix", sockPath)
+	must.NoError(t, err)
+	defer listener.Close()
+
+	// Get the actual socket ownership for assertions
+	sockInfo, err := os.Stat(sockPath)
+	must.NoError(t, err)
+	sockStat := sockInfo.Sys().(*syscall.Stat_t)
+
+	testCases := []struct {
+		name      string
+		input     string
+		expectOk  bool
+		expectUid int
+		expectGid int
+	}{
+		{
+			name:      "unix colon prefix",
+			input:     "unix:" + sockPath,
+			expectOk:  true,
+			expectUid: int(sockStat.Uid),
+			expectGid: int(sockStat.Gid),
+		},
+		{
+			name:      "unix double slash prefix",
+			input:     "unix://" + sockPath,
+			expectOk:  true,
+			expectUid: int(sockStat.Uid),
+			expectGid: int(sockStat.Gid),
+		},
+		{
+			name:  "http scheme returns false",
+			input: "http://localhost:8080",
+		},
+		{
+			name:  "tcp scheme returns false",
+			input: "tcp://127.0.0.1:8080",
+		},
+		{
+			name:  "empty string returns false",
+			input: "",
+		},
+		{
+			name:  "non-existent socket returns false",
+			input: "unix:///no/such/path/test.sock",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			uid, gid, ok := getSocketOwner(tc.input)
+			must.Eq(t, tc.expectOk, ok, must.Sprintf("getSocketOwner(%q) ok mismatch", tc.input))
+			if tc.expectOk {
+				must.Eq(t, tc.expectUid, uid, must.Sprintf("getSocketOwner(%q) uid mismatch", tc.input))
+				must.Eq(t, tc.expectGid, gid, must.Sprintf("getSocketOwner(%q) gid mismatch", tc.input))
+			}
+		})
+	}
+}
+
+// TestEnsureFifoAccessible verifies the FIFO accessibility logic for rootless podman.
+func TestEnsureFifoAccessible(t *testing.T) {
+	ci.Parallel(t)
+
+	// Use /tmp to avoid macOS socket path length limit (108 chars)
+	dir, err := os.MkdirTemp("/tmp", "fifo-test-*")
+	must.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	// Create a unix socket for tests that need it
+	sockPath := filepath.Join(dir, "t.sock")
+	listener, err := net.Listen("unix", sockPath)
+	must.NoError(t, err)
+	defer listener.Close()
+
+	sockInfo, err := os.Stat(sockPath)
+	must.NoError(t, err)
+	sockStat := sockInfo.Sys().(*syscall.Stat_t)
+
+	testCases := []struct {
+		name       string
+		fifoPath   string
+		rootless   bool
+		socketPath string
+		expectErr  string
+		// If set, verify fifo ownership matches socket owner
+		verifyChown bool
+		// If true, skip creating a FIFO (for empty/noop cases)
+		skipFifo bool
+		// If true, create a symlink instead of a FIFO (for symlink attack test)
+		createSymlink bool
+		// If true, test requires root
+		requireRoot bool
+	}{
+		{
+			name:     "empty path is no-op",
+			fifoPath: "",
+			rootless: true,
+			skipFifo: true,
+		},
+		{
+			name:       "rootful is no-op even with bad path",
+			fifoPath:   "/no/such/fifo",
+			rootless:   false,
+			socketPath: "unix:" + sockPath,
+			skipFifo:   true,
+		},
+		{
+			name:        "chown to socket owner",
+			rootless:    true,
+			socketPath:  "unix:" + sockPath,
+			verifyChown: true,
+		},
+		{
+			name:       "noop for tcp socket path",
+			rootless:   true,
+			socketPath: "http://localhost:8080",
+			// TCP socket — cannot determine owner, should noop (no chown, no chmod)
+		},
+		{
+			name:       "noop for non-existent fifo with tcp socket",
+			fifoPath:   "/no/such/fifo/path",
+			rootless:   true,
+			socketPath: "http://localhost:8080",
+			skipFifo:   true,
+			// Should not error — just logs and returns nil
+		},
+		{
+			name:          "rejects symlink (TOCTOU protection)",
+			rootless:      true,
+			socketPath:    "unix:" + sockPath,
+			expectErr:     "failed to open fifo",
+			createSymlink: true,
+			skipFifo:      true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.requireRoot && os.Getuid() != 0 {
+				t.Skip("test requires root")
+			}
+
+			logger := testlog.HCLogger(t)
+
+			fifoPath := tc.fifoPath
+			if !tc.skipFifo {
+				fifoPath = filepath.Join(dir, fmt.Sprintf("fifo-%s", tc.name))
+				must.NoError(t, exec.Command("mkfifo", fifoPath).Run())
+				must.NoError(t, os.Chmod(fifoPath, 0600))
+			}
+			if tc.createSymlink {
+				// Simulate a symlink swap attack: task replaces FIFO with a
+				// symlink pointing to an arbitrary file (e.g. /etc/shadow).
+				fifoPath = filepath.Join(dir, fmt.Sprintf("fifo-%s", tc.name))
+				target := filepath.Join(dir, "attack-target")
+				must.NoError(t, os.WriteFile(target, []byte("sensitive"), 0600))
+				must.NoError(t, os.Symlink(target, fifoPath))
+			}
+
+			var client *api.API
+			if tc.socketPath != "" {
+				client = api.NewClient(logger, api.ClientConfig{
+					SocketPath:  tc.socketPath,
+					HttpTimeout: 5 * time.Second,
+				})
+			} else {
+				client = &api.API{}
+			}
+			client.SetRootless(tc.rootless)
+
+			err := ensureFifoAccessible(logger, fifoPath, client)
+
+			if tc.expectErr != "" {
+				must.Error(t, err, must.Sprint("ensureFifoAccessible should have returned an error"))
+				must.ErrorContains(t, err, tc.expectErr)
+				return
+			}
+			must.NoError(t, err, must.Sprint("ensureFifoAccessible should not have returned an error"))
+
+			if tc.verifyChown {
+				info, statErr := os.Stat(fifoPath)
+				must.NoError(t, statErr)
+				fifoStat := info.Sys().(*syscall.Stat_t)
+				must.Eq(t, int(sockStat.Uid), int(fifoStat.Uid), must.Sprint("fifo uid should match socket owner after chown"))
+				must.Eq(t, int(sockStat.Gid), int(fifoStat.Gid), must.Sprint("fifo gid should match socket owner after chown"))
+			}
+		})
+	}
+}
+
+// TestPodmanDriver_LogFifoAccessible is an integration test that verifies
+// the k8s-file log driver path works end-to-end: the driver makes FIFOs
+// accessible to rootless podman before starting the container, and container
+// output is captured correctly through the FIFO.
+func TestPodmanDriver_LogFifoAccessible(t *testing.T) {
+	ci.Parallel(t)
+
+	stdoutMagic := uuid.Generate()
+	stderrMagic := uuid.Generate()
+
+	taskCfg := newTaskConfig("", []string{
+		"sh",
+		"-c",
+		fmt.Sprintf("echo %s; 1>&2 echo %s", stdoutMagic, stderrMagic),
+	})
+	// Use default logging (maps to k8s-file internally), which is the path
+	// that triggers ensureFifoAccessible before container start.
+	taskCfg.Logging.Driver = "nomad"
+
+	task := &drivers.TaskConfig{
+		ID:        uuid.Generate(),
+		Name:      "logFifoAccess",
+		AllocID:   uuid.Generate(),
+		Resources: createBasicResources(),
+	}
+	must.NoError(t, task.EncodeConcreteDriverConfig(&taskCfg))
+
+	d := podmanDriverHarness(t, nil)
+	cleanup := d.MkAllocDir(task, true)
+	defer cleanup()
+
+	// Verify the stdout FIFO exists before start
+	_, err := os.Stat(task.StdoutPath)
+	must.NoError(t, err)
+
+	_, _, err = d.StartTask(task)
+	must.NoError(t, err)
+
+	defer func() {
+		_ = d.DestroyTask(task.ID, true)
+	}()
+
+	// After StartTask, verify the FIFO permissions were made accessible.
+	// In rootless mode this will be chowned; in rootful mode it's unchanged.
+	// Either way, the FIFO should still exist and be writable.
+	fifoInfo, err := os.Stat(task.StdoutPath)
+	must.NoError(t, err)
+	fifoMode := fifoInfo.Mode()
+	// The FIFO should be a named pipe
+	must.True(t, fifoMode&os.ModeNamedPipe != 0, must.Sprint("stdout fifo should be a named pipe after StartTask"))
+
+	// Wait for container to finish
+	waitCh, err := d.WaitTask(context.Background(), task.ID)
+	must.NoError(t, err, must.Sprint("WaitTask should not fail"))
+
+	select {
+	case res := <-waitCh:
+		must.Eq(t, 0, res.ExitCode, must.Sprint("container should exit cleanly"))
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Container did not exit in time")
+	}
+
+	// Verify logs were captured through the FIFO — this confirms conmon
+	// could write to the FIFO (the original bug would cause empty logs
+	// or a permission denied startup failure).
+	stdoutLog := readStdoutLog(t, task)
+	must.StrContains(t, stdoutLog, stdoutMagic)
+	must.StrContains(t, stdoutLog, stderrMagic)
+}
+
+// TestPodmanDriver_CustomNetwork validates custom network_mode behavior:
+// successful attachment, non-existent network error, and unreachable socket error.
+func TestPodmanDriver_CustomNetwork(t *testing.T) {
+	ci.Parallel(t)
+
+	// Create a temporary network for the success case
+	networkName := fmt.Sprintf("test-net-%s", uuid.Generate()[:8])
+	out, err := exec.Command("podman", "network", "create", networkName).CombinedOutput()
+	if err != nil {
+		t.Skipf("Cannot create test network (podman not available?): %s: %s", err, out)
+	}
+	defer func() {
+		_, _ = exec.Command("podman", "network", "rm", networkName).CombinedOutput()
+	}()
+
+	testCases := []struct {
+		name          string
+		networkMode   string
+		harnessConfig map[string]interface{}
+		expectErr     bool
+		errContains   []string
+		verifyNetwork bool // if true, inspect container to verify network attachment
+	}{
+		{
+			name:          "attaches to custom network without static IP",
+			networkMode:   networkName,
+			expectErr:     false,
+			verifyNetwork: true,
+		},
+		{
+			name:        "non-existent network returns clear error",
+			networkMode: "this-network-definitely-does-not-exist-xyz",
+			expectErr:   true,
+			errContains: []string{"not found", "podman network ls"},
+		},
+		{
+			name:        "unreachable socket hints at version requirement",
+			networkMode: "some-custom-network",
+			harnessConfig: map[string]interface{}{
+				"Socket": []PluginSocketConfig{{
+					Name:       "default",
+					SocketPath: "unix:///tmp/nonexistent-podman-socket-test.sock",
+				}},
+			},
+			expectErr:   true,
+			errContains: []string{"failed to check network"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			taskCfg := newTaskConfig("", busyboxLongRunningCmd)
+			taskCfg.NetworkMode = tc.networkMode
+
+			task := &drivers.TaskConfig{
+				ID:        uuid.Generate(),
+				Name:      "custom_net_test",
+				AllocID:   uuid.Generate(),
+				Resources: createBasicResources(),
+			}
+			must.NoError(t, task.EncodeConcreteDriverConfig(&taskCfg))
+
+			d := podmanDriverHarness(t, tc.harnessConfig)
+			cleanup := d.MkAllocDir(task, true)
+			defer cleanup()
+
+			containerName := BuildContainerName(task)
+			_, network, err := d.StartTask(task)
+
+			if tc.expectErr {
+				must.Error(t, err)
+				for _, substr := range tc.errContains {
+					must.StrContains(t, err.Error(), substr)
+				}
+				return
+			}
+
+			must.NoError(t, err)
+			defer func() {
+				_ = d.DestroyTask(task.ID, true)
+			}()
+
+			if tc.verifyNetwork {
+				must.NoError(t, d.WaitUntilStarted(task.ID, 20*time.Second))
+
+				inspectData, inspectErr := getPodmanDriver(t, d).defaultPodman.ContainerInspect(context.Background(), containerName)
+				must.NoError(t, inspectErr)
+
+				// Container must be on the expected network
+				_, hasNetwork := inspectData.NetworkSettings.Networks[tc.networkMode]
+				must.True(t, hasNetwork, must.Sprintf("expected container on network %q, got: %v", tc.networkMode, inspectData.NetworkSettings.Networks))
+
+				// Driver-reported IP must match the network's IP
+				netData := inspectData.NetworkSettings.Networks[tc.networkMode]
+				must.Eq(t, netData.IPAddress, network.IP)
+				must.NotEq(t, "", network.IP)
+			}
+		})
+	}
 }

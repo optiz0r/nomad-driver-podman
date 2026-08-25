@@ -1,4 +1,18 @@
-## UNRELEASED
+## 0.6.5 (July 13, 2026)
+
+IMPROVEMENTS:
+* driver: Adds support for loading `oci-archive` and `docker-archive` images from `http(s)` URLs. [[GH-517](https://github.com/hashicorp/nomad-driver-podman/pull/517)]
+* config: Adds support for plugin configuration `networking.default_rootless_mode` to override the default networking mode when run rootlessly. [[GH-495](https://github.com/hashicorp/nomad-driver-podman/pull/495)]
+* config: Support custom Podman network names for static IP/MAC options via `network_mode`. [[GH-509](https://github.com/hashicorp/nomad-driver-podman/pull/509)]
+* config: Added `ipc_mode` task configuration option to control the container IPC namespace (`host`, `private`, `shareable`, `none`, `container:<id>`, `ns:<path>`, `task:<name>`) [[GH-515](https://github.com/hashicorp/nomad-driver-podman/pull/515)]
+* config: Added support for `os`, `arch` and `variant` task config options to override the platform of the image to pull. [[GH-514](https://github.com/hashicorp/nomad-driver-podman/pull/514)]
+* build: Eliminated transitive dependency on Docker packages via `hclutils`.[[GH-512](https://github.com/hashicorp/nomad-driver-podman/pull/512)]
+
+BUG FIXES:
+* api: Fixed file descriptor leak when getting logs from the task [[GH-508](https://github.com/hashicorp/nomad-driver-podman/pull/508)]
+* driver: Fixed static IP configuration (`static_ips`, `ipv4_address`, `ipv6_address`, `static_mac`) being silently ignored, corrected related per-network map handling and `driverNet.IP` resolution for service discovery. [[GH-507](https://github.com/hashicorp/nomad-driver-podman/pull/507)]
+* driver: Fixed log FIFO permission denied error when using rootless podman with Nomad run as root. [[GH-510](https://github.com/hashicorp/nomad-driver-podman/pull/510)]
+* driver: Fixed `userns=auto` being ignored when no sub-options (e.g. size) are specified [[GH-511](https://github.com/hashicorp/nomad-driver-podman/pull/511)]
 
 ## 0.6.4 (December 10, 2025)
 

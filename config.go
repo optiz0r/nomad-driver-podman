@@ -1,11 +1,11 @@
-// Copyright IBM Corp. 2019, 2025
+// Copyright IBM Corp. 2019, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package main
 
 import (
 	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/nomad/helper/pluginutils/hclutils"
+	"github.com/hashicorp/nomad-driver-podman/internal/hclcompat"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 )
 
@@ -60,6 +60,16 @@ var (
 			options = {}
 		}`)),
 
+		"networking": hclspec.NewDefault(
+			hclspec.NewBlock("networking", false,
+				hclspec.NewObject(map[string]*hclspec.Spec{
+					// empty will default to either pasta (podman 5.0+) or slirp4netns
+					"default_rootless_mode": hclspec.NewAttr(
+						"default_rootless_mode", "string", false),
+				})), hclspec.NewLiteral(`{
+			default_rootless_mode = ""
+		}`)),
+
 		// A list of sockets for the driver to manage
 		"socket": hclspec.NewBlockList("socket", socketBodySpec),
 		// the path to the podman api socket
@@ -97,6 +107,9 @@ var (
 		"working_dir":    hclspec.NewAttr("working_dir", "string", false),
 		"hostname":       hclspec.NewAttr("hostname", "string", false),
 		"image":          hclspec.NewAttr("image", "string", true),
+		"arch":           hclspec.NewAttr("arch", "string", false),
+		"os":             hclspec.NewAttr("os", "string", false),
+		"variant":        hclspec.NewAttr("variant", "string", false),
 		"image_pull_timeout": hclspec.NewDefault(
 			hclspec.NewAttr("image_pull_timeout", "string", false),
 			hclspec.NewLiteral(`"5m"`),
@@ -116,6 +129,7 @@ var (
 		"memory_swap":        hclspec.NewAttr("memory_swap", "string", false),
 		"memory_swappiness":  hclspec.NewAttr("memory_swappiness", "number", false),
 		"network_mode":       hclspec.NewAttr("network_mode", "string", false),
+		"ipc_mode":           hclspec.NewAttr("ipc_mode", "string", false),
 		"oom_score_adj":      hclspec.NewAttr("oom_score_adj", "number", false),
 		"extra_hosts":        hclspec.NewAttr("extra_hosts", "list(string)", false),
 		"pids_limit":         hclspec.NewAttr("pids_limit", "number", false),
@@ -166,11 +180,19 @@ type LoggingConfig struct {
 	Options map[string]string `codec:"options"`
 }
 
+// NetworkingConfig controls default network setup behaviors
+type NetworkingConfig struct {
+	// DefaultRootlessMode overrides the default network mode when running in
+	// rootlessly. By default Podman >5.0 will be defaulted to pasta instead of
+	// slirp4netns
+	DefaultRootlessMode string `codec:"default_rootless_mode"`
+}
+
 // LoggingConfig is the tasks logging configuration
 // keep in sync with `LoggingConfig`
 type TaskLoggingConfig struct {
-	Driver  string             `codec:"driver"`
-	Options hclutils.MapStrStr `codec:"options"`
+	Driver  string              `codec:"driver"`
+	Options hclcompat.MapStrStr `codec:"options"`
 }
 
 // Empty returns true if the logging configuration is not set.
@@ -207,6 +229,7 @@ type PluginConfig struct {
 	ExtraLabels          []string             `codec:"extra_labels"`
 	DNSServers           []string             `codec:"dns_servers"`
 	Logging              LoggingConfig        `codec:"logging"`
+	Networking           NetworkingConfig     `codec:"networking"`
 }
 
 // LogWarnings will emit logs about known problematic configurations
@@ -218,50 +241,54 @@ func (c *PluginConfig) LogWarnings(logger hclog.Logger) {
 
 // TaskConfig is the driver configuration of a task within a job
 type TaskConfig struct {
-	ApparmorProfile   string             `codec:"apparmor_profile"`
-	Args              []string           `codec:"args"`
-	Auth              TaskAuthConfig     `codec:"auth"`
-	AuthSoftFail      bool               `codec:"auth_soft_fail"`
-	Ports             []string           `codec:"ports"`
-	Tmpfs             []string           `codec:"tmpfs"`
-	Volumes           []string           `codec:"volumes"`
-	CapAdd            []string           `codec:"cap_add"`
-	CapDrop           []string           `codec:"cap_drop"`
-	SelinuxOpts       []string           `codec:"selinux_opts"`
-	Command           string             `codec:"command"`
-	Devices           []string           `codec:"devices"`
-	Entrypoint        any                `codec:"entrypoint"` // any for compat
-	WorkingDir        string             `codec:"working_dir"`
-	Hostname          string             `codec:"hostname"`
-	Image             string             `codec:"image"`
-	ImagePullTimeout  string             `codec:"image_pull_timeout"`
-	IPv4Address       string             `codec:"ipv4_address"`
-	IPv6Address       string             `codec:"ipv6_address"`
-	StaticIPs         []string           `codec:"static_ips"`
-	StaticMAC         string             `codec:"static_mac"`
-	InitPath          string             `codec:"init_path"`
-	Logging           TaskLoggingConfig  `codec:"logging"`
-	Labels            hclutils.MapStrStr `codec:"labels"`
-	MemoryReservation string             `codec:"memory_reservation"`
-	MemorySwap        string             `codec:"memory_swap"`
-	NetworkMode       string             `codec:"network_mode"`
-	OOMScoreAdj       int16              `codec:"oom_score_adj"`
-	ExtraHosts        []string           `codec:"extra_hosts"`
-	CPUCFSPeriod      uint64             `codec:"cpu_cfs_period"`
-	MemorySwappiness  int64              `codec:"memory_swappiness"`
-	PidsLimit         int64              `codec:"pids_limit"`
-	PortMap           hclutils.MapStrInt `codec:"port_map"`
-	Socket            string             `codec:"socket"`
-	Sysctl            hclutils.MapStrStr `codec:"sysctl"`
-	Ulimit            hclutils.MapStrStr `codec:"ulimit"`
-	CPUHardLimit      bool               `codec:"cpu_hard_limit"`
-	Init              bool               `codec:"init"`
-	Tty               bool               `codec:"tty"`
-	ForcePull         bool               `codec:"force_pull"`
-	Privileged        bool               `codec:"privileged"`
-	ReadOnlyRootfs    bool               `codec:"readonly_rootfs"`
-	UserNS            string             `codec:"userns"`
-	ShmSize           string             `codec:"shm_size"`
-	SecurityOpt       []string           `codec:"security_opt"`
-	UserSquash        bool               `codec:"user_squash"`
+	ApparmorProfile   string              `codec:"apparmor_profile"`
+	Args              []string            `codec:"args"`
+	Auth              TaskAuthConfig      `codec:"auth"`
+	AuthSoftFail      bool                `codec:"auth_soft_fail"`
+	Ports             []string            `codec:"ports"`
+	Tmpfs             []string            `codec:"tmpfs"`
+	Volumes           []string            `codec:"volumes"`
+	CapAdd            []string            `codec:"cap_add"`
+	CapDrop           []string            `codec:"cap_drop"`
+	SelinuxOpts       []string            `codec:"selinux_opts"`
+	Command           string              `codec:"command"`
+	Devices           []string            `codec:"devices"`
+	Entrypoint        any                 `codec:"entrypoint"` // any for compat
+	WorkingDir        string              `codec:"working_dir"`
+	Hostname          string              `codec:"hostname"`
+	Image             string              `codec:"image"`
+	ImagePullTimeout  string              `codec:"image_pull_timeout"`
+	IPv4Address       string              `codec:"ipv4_address"`
+	IPv6Address       string              `codec:"ipv6_address"`
+	StaticIPs         []string            `codec:"static_ips"`
+	StaticMAC         string              `codec:"static_mac"`
+	InitPath          string              `codec:"init_path"`
+	Logging           TaskLoggingConfig   `codec:"logging"`
+	Labels            hclcompat.MapStrStr `codec:"labels"`
+	MemoryReservation string              `codec:"memory_reservation"`
+	MemorySwap        string              `codec:"memory_swap"`
+	NetworkMode       string              `codec:"network_mode"`
+	IPCMode           string              `codec:"ipc_mode"`
+	OOMScoreAdj       int16               `codec:"oom_score_adj"`
+	ExtraHosts        []string            `codec:"extra_hosts"`
+	CPUCFSPeriod      uint64              `codec:"cpu_cfs_period"`
+	MemorySwappiness  int64               `codec:"memory_swappiness"`
+	PidsLimit         int64               `codec:"pids_limit"`
+	PortMap           hclcompat.MapStrInt `codec:"port_map"`
+	Socket            string              `codec:"socket"`
+	Sysctl            hclcompat.MapStrStr `codec:"sysctl"`
+	Ulimit            hclcompat.MapStrStr `codec:"ulimit"`
+	CPUHardLimit      bool                `codec:"cpu_hard_limit"`
+	Init              bool                `codec:"init"`
+	Tty               bool                `codec:"tty"`
+	ForcePull         bool                `codec:"force_pull"`
+	Arch              string              `codec:"arch"`
+	OS                string              `codec:"os"`
+	Variant           string              `codec:"variant"`
+	Privileged        bool                `codec:"privileged"`
+	ReadOnlyRootfs    bool                `codec:"readonly_rootfs"`
+	UserNS            string              `codec:"userns"`
+	ShmSize           string              `codec:"shm_size"`
+	SecurityOpt       []string            `codec:"security_opt"`
+	UserSquash        bool                `codec:"user_squash"`
 }

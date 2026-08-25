@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2019, 2025
+// Copyright IBM Corp. 2019, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package main
@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/armon/circbuf"
@@ -50,6 +52,11 @@ const (
 
 	// fingerprintPeriod is the interval at which the driver will send fingerprint responses
 	fingerprintPeriod = 30 * time.Second
+
+	// defaultHTTPTimeout bounds requests made by the driver's httpClient when
+	// downloading image archives from an http(s) URL. It matches the 60s used
+	// by the podman api client.
+	defaultHTTPTimeout = 60 * time.Second
 
 	// taskHandleVersion is the version of task handle which this driver sets
 	// and understands how to decode driver state
@@ -127,6 +134,11 @@ type Driver struct {
 	// For any call where it's unspecified/unknown which podman should be used
 	defaultPodman *api.API
 
+	// httpClient is used to download image archives referenced by an http(s)
+	// URL. It is kept on the driver so request behaviour is configured in one
+	// place rather than relying on http.DefaultClient.
+	httpClient *http.Client
+
 	// singleflight group to prevent parallel image downloads
 	pullGroup singleflight.Group
 
@@ -157,6 +169,7 @@ func NewPodmanDriver(logger hclog.Logger) drivers.DriverPlugin {
 		ctx:             ctx,
 		signalShutdown:  cancel,
 		logger:          logger.Named(pluginName),
+		httpClient:      &http.Client{Timeout: defaultHTTPTimeout},
 		pauseContainers: make(map[string]struct{}),
 	}
 }
@@ -703,6 +716,13 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 	if err != nil {
 		return nil, nil, err
 	}
+	if rootlessMountDir != "" && createOpts.LogConfiguration.Driver == "k8s-file" {
+		rootlessDir := &rootlessTaskDir{
+			mountDir: rootlessMountDir,
+			allocDir: cfg.AllocDir,
+		}
+		createOpts.LogConfiguration.Path = rootlessDir.rewritePath(createOpts.LogConfiguration.Path)
+	}
 
 	// Note: we intentionally don't clean up the bind mount on StartTask error.
 	// The mount persists so that Nomad can retry, and rootlessMount() will
@@ -731,11 +751,11 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 		return nil, nil, err
 	}
 
-	hard, soft, err := memoryLimits(cfg.Resources.NomadResources.Memory, podmanTaskConfig.MemoryReservation)
+	hard, reserved, err := memoryLimits(cfg.Resources.NomadResources.Memory, podmanTaskConfig.MemoryReservation)
 	if err != nil {
 		return nil, nil, err
 	}
-	createOpts.ContainerResourceConfig.ResourceLimits.Memory.Reservation = soft
+	createOpts.ContainerResourceConfig.ResourceLimits.Memory.Reservation = reserved
 	createOpts.ContainerResourceConfig.ResourceLimits.Memory.Limit = hard
 	// set PidsLimit only if configured.
 	if podmanTaskConfig.PidsLimit > 0 {
@@ -796,7 +816,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 	// Populate --userns mode only if configured
 	if podmanTaskConfig.UserNS != "" {
 		userns, mappings, userNSerr := parseUserNSConfig(podmanTaskConfig.UserNS)
-		if err != nil {
+		if userNSerr != nil {
 			return nil, nil, fmt.Errorf("failed to parse userns configuration: %w", userNSerr)
 		}
 		createOpts.ContainerSecurityConfig.UserNS = userns
@@ -810,6 +830,45 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 			return nil, nil, memErr
 		}
 		createOpts.ContainerStorageConfig.ShmSize = &shmsize
+	}
+
+	// Populate the IPC namespace mode only if configured. When unset, Podman
+	// applies its default (private). This mirrors the network_mode handling and
+	// supports the same task: convenience for sharing within an allocation,
+	// which is required for use cases such as NVIDIA MPS GPU sharing.
+	if podmanTaskConfig.IPCMode != "" {
+		// shm_size only makes sense when the container owns its /dev/shm, i.e.
+		// a private or shareable IPC namespace. host/none/container/ns either
+		// inherit an external /dev/shm or have none, so reject the combination
+		// to fail fast with a clear error instead of letting Podman error out.
+		ipcMode := podmanTaskConfig.IPCMode
+		ownsShm := ipcMode == "private" || ipcMode == "shareable"
+		if podmanTaskConfig.ShmSize != "" && !ownsShm {
+			return nil, nil, fmt.Errorf("shm_size cannot be used with ipc_mode=%q; it requires a private or shareable IPC namespace", ipcMode)
+		}
+
+		switch {
+		case ipcMode == "host":
+			createOpts.ContainerStorageConfig.IpcNS.NSMode = api.Host
+		case ipcMode == "private":
+			createOpts.ContainerStorageConfig.IpcNS.NSMode = api.Private
+		case ipcMode == "shareable":
+			createOpts.ContainerStorageConfig.IpcNS.NSMode = api.Shareable
+		case ipcMode == "none":
+			createOpts.ContainerStorageConfig.IpcNS.NSMode = api.NamespaceMode("none")
+		case strings.HasPrefix(ipcMode, "container:"):
+			createOpts.ContainerStorageConfig.IpcNS.NSMode = api.FromContainer
+			createOpts.ContainerStorageConfig.IpcNS.Value = strings.TrimPrefix(ipcMode, "container:")
+		case strings.HasPrefix(ipcMode, "ns:"):
+			createOpts.ContainerStorageConfig.IpcNS.NSMode = api.Path
+			createOpts.ContainerStorageConfig.IpcNS.Value = strings.TrimPrefix(ipcMode, "ns:")
+		case strings.HasPrefix(ipcMode, "task:"):
+			otherTaskName := strings.TrimPrefix(ipcMode, "task:")
+			createOpts.ContainerStorageConfig.IpcNS.NSMode = api.FromContainer
+			createOpts.ContainerStorageConfig.IpcNS.Value = BuildContainerNameForTask(otherTaskName, cfg)
+		default:
+			return nil, nil, fmt.Errorf("invalid ipc_mode %q: expected one of host, private, shareable, none, container:<id>, ns:<path>, task:<name>", ipcMode)
+		}
 	}
 
 	// Get Podman version as networking option availability depends on the version
@@ -838,6 +897,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 		}
 	}
 	// Configure network
+	networkName := "default"
 	if cfg.NetworkIsolation != nil && cfg.NetworkIsolation.Path != "" {
 		createOpts.ContainerNetworkConfig.NetNS.NSMode = api.Path
 		createOpts.ContainerNetworkConfig.NetNS.Value = cfg.NetworkIsolation.Path
@@ -855,13 +915,17 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 					createOpts.ContainerNetworkConfig.NetNS.NSMode = api.Bridge
 				}
 			} else {
-				pastaCheck, _ := version2.NewConstraint(">=5.0.0")
-				if pastaCheck.Check(versionValue) {
-					// podman pasta is default for rootless podman >= 5.0.0
-					createOpts.ContainerNetworkConfig.NetNS.NSMode = api.Pasta
+				if d.config.Networking.DefaultRootlessMode != "" {
+					createOpts.ContainerNetworkConfig.NetNS.NSMode = api.NamespaceMode(d.config.Networking.DefaultRootlessMode)
 				} else {
-					// slirp4netns is default for rootless podman < 5.0.0
-					createOpts.ContainerNetworkConfig.NetNS.NSMode = api.Slirp
+					pastaCheck, _ := version2.NewConstraint(">=5.0.0")
+					if pastaCheck.Check(versionValue) {
+						// podman pasta is default for rootless podman >= 5.0.0
+						createOpts.ContainerNetworkConfig.NetNS.NSMode = api.Pasta
+					} else {
+						// slirp4netns is default for rootless podman < 5.0.0
+						createOpts.ContainerNetworkConfig.NetNS.NSMode = api.Slirp
+					}
 				}
 			}
 		case podmanTaskConfig.NetworkMode == "bridge":
@@ -885,7 +949,24 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 			createOpts.ContainerNetworkConfig.NetNS.NSMode = api.FromContainer
 			createOpts.ContainerNetworkConfig.NetNS.Value = BuildContainerNameForTask(otherTaskName, cfg)
 		default:
-			return nil, nil, fmt.Errorf("Unknown/Unsupported network mode: %s", podmanTaskConfig.NetworkMode)
+			// Treat any unrecognized value as a custom Podman network name
+			// (e.g., one created via "podman network create mynet").
+			// Custom networks are bridged networks under the hood, so we set
+			// NSMode = Bridge and specify the network name in the Networks map.
+			// NetworkExists requires Podman API v4+
+			exists, netErr := podmanClient.NetworkExists(d.ctx, podmanTaskConfig.NetworkMode)
+			if netErr != nil {
+				return nil, nil, fmt.Errorf("failed to check network %q: %w", podmanTaskConfig.NetworkMode, netErr)
+			}
+			if !exists {
+				return nil, nil, fmt.Errorf("network %q not found, verify with: podman network ls", podmanTaskConfig.NetworkMode)
+			}
+			d.logger.Debug("Using custom network", "network", podmanTaskConfig.NetworkMode)
+			createOpts.ContainerNetworkConfig.NetNS.NSMode = api.Bridge
+			networkName = podmanTaskConfig.NetworkMode
+			// Always populate the Networks map for custom networks so Podman
+			// attaches to the correct network, not just the default bridge.
+			createOpts.Networks = map[string]api.PerNetworkOptions{networkName: {}}
 		}
 	}
 
@@ -945,7 +1026,11 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 					}
 				}
 			}
-			createOpts.Networks = map[string]api.PerNetworkOptions{"default": netOpts}
+			// Only bridge mode uses named networks; other modes (host, slirp4netns,
+			// none, task:*, container:*, ns:*) don't honor per-network options.
+			if createOpts.ContainerNetworkConfig.NetNS.NSMode == api.Bridge {
+				createOpts.Networks = map[string]api.PerNetworkOptions{networkName: netOpts}
+			}
 		} else {
 			// Before version 4, there were StaticIP, StaticIPv6 and StaticMAC properties
 			if staticIPv4 != nil {
@@ -1004,6 +1089,11 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 			&podmanTaskConfig.Auth,
 			podmanTaskConfig.AuthSoftFail,
 			podmanTaskConfig.ForcePull,
+			imagePlatform{
+				arch:    podmanTaskConfig.Arch,
+				os:      podmanTaskConfig.OS,
+				variant: podmanTaskConfig.Variant,
+			},
 			podmanClient,
 			imagePullTimeout,
 			cfg,
@@ -1050,6 +1140,22 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 	}
 
 	if !recoverRunningContainer {
+		// Ensure log FIFOs are accessible by the rootless podman user before starting
+		// the container. Nomad's logmon creates FIFOs owned by root:root with 0600;
+		// conmon (running as the podman user) needs write access. If chown fails,
+		// ContainerStart will also fail (conmon crashes with EACCES), so return
+		// early with a clearer error message.
+		if createOpts.LogConfiguration.Driver == "k8s-file" {
+			if fifoErr := ensureFifoAccessible(d.logger, cfg.StdoutPath, podmanClient); fifoErr != nil {
+				cleanup()
+				return nil, nil, fmt.Errorf("failed to make stdout fifo accessible: %w", fifoErr)
+			}
+			if fifoErr := ensureFifoAccessible(d.logger, cfg.StderrPath, podmanClient); fifoErr != nil {
+				cleanup()
+				return nil, nil, fmt.Errorf("failed to make stderr fifo accessible: %w", fifoErr)
+			}
+		}
+
 		if startErr := podmanClient.ContainerStart(d.ctx, containerID); startErr != nil {
 			cleanup()
 			return nil, nil, fmt.Errorf("failed to start task, could not start container: %w", startErr)
@@ -1063,9 +1169,14 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 		return nil, nil, fmt.Errorf("failed to start task, could not inspect container : %w", err)
 	}
 
+	// Resolve the container IP. For the default bridge network, Podman
+	// populates the top-level IPAddress field. For named networks it is
+	// empty and the IP lives in the per-network map instead.
+	containerIP := resolveContainerIP(inspectData.NetworkSettings, networkName)
+
 	driverNet := &drivers.DriverNetwork{
 		PortMap:       podmanTaskConfig.PortMap,
-		IP:            inspectData.NetworkSettings.IPAddress,
+		IP:            containerIP,
 		AutoAdvertise: true,
 	}
 
@@ -1087,16 +1198,39 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle,
 
 	go h.runContainerMonitor()
 
-	d.logger.Info("Completely started container", "taskID", cfg.ID, "container", containerID, "ip", inspectData.NetworkSettings.IPAddress)
+	d.logger.Info("Completely started container", "taskID", cfg.ID, "container", containerID, "ip", containerIP)
 
 	return handle, driverNet, nil
 }
 
-func memoryLimits(r drivers.MemoryResources, reservation string) (hard, soft *int64, err error) {
-	memoryMax := r.MemoryMaxMB * 1024 * 1024
-	memory := r.MemoryMB * 1024 * 1024
+const (
+	// memoryNoLimit is a sentinel value for memory_max that indicates the
+	// driver should not enforce a maximum memory limit
+	memoryNoLimit = -1
+)
 
+// memoryLimits computes the memory and memory_reservation values passed along to
+// the podman host config. These fields represent hard and soft/reserved memory
+// limits from podman's perspective, respectively.
+//
+// The resources.memory field in the jobspec is normally interpreted as a hard
+// limit.
+//
+// If task.config.memory_reservation is set, it is treated as the reserve and
+// resources.memory is the hard limit. This entirely bypasses the scheduler
+// oversubscription setting.
+//
+// If oversubscription is enabled and resources.memory_max is set,
+// resources.memory_max is treated as the hard limit and either resources.memory
+// or task.config.memory_reservation (whichever is less) is the soft limit. If
+// resources.memory_max = -1, there is no hard limit.
+//
+// Returns (memory (hard), memory_reservation (soft)) values in bytes.
+func memoryLimits(r drivers.MemoryResources, reservation string) (hard, soft *int64, err error) {
+	memoryMax := r.MemoryMaxMB
+	memory := r.MemoryMB * 1024 * 1024
 	var reserved *int64
+
 	if reservation != "" {
 		reservation, err := memoryInBytes(reservation)
 		if err != nil {
@@ -1104,19 +1238,24 @@ func memoryLimits(r drivers.MemoryResources, reservation string) (hard, soft *in
 		}
 		reserved = &reservation
 	}
-
+	if memoryMax == memoryNoLimit {
+		if reserved != nil && *reserved < memory {
+			return nil, reserved, nil
+		}
+		return nil, &memory, nil
+	}
 	if memoryMax > 0 {
+		memoryMax = memoryMax * 1024 * 1024
 		if reserved != nil && *reserved < memory {
 			memory = *reserved
 		}
 		return &memoryMax, &memory, nil
 	}
-
 	if memory > 0 {
 		return &memory, reserved, nil
 	}
 
-	// We may never actually be here
+	// should be unreachable b/c a default should always be set by the server
 	return nil, reserved, nil
 }
 
@@ -1212,6 +1351,19 @@ func sliceMergeUlimit(ulimitsRaw map[string]string) ([]spec.POSIXRlimit, error) 
 	return ulimits, nil
 }
 
+// imagePlatform holds optional OS/architecture overrides for an image pull.
+// These correspond to podman's --arch, --os and --variant flags.
+type imagePlatform struct {
+	arch    string
+	os      string
+	variant string
+}
+
+// isSet reports whether any platform override has been requested.
+func (p imagePlatform) isSet() bool {
+	return p.arch != "" || p.os != "" || p.variant != ""
+}
+
 // Creates the requested image if missing from storage
 // returns the 64-byte image ID as an unique image identifier
 func (d *Driver) createImage(
@@ -1219,15 +1371,28 @@ func (d *Driver) createImage(
 	auth *TaskAuthConfig,
 	authSoftFail bool,
 	forcePull bool,
+	platform imagePlatform,
 	podmanClient *api.API,
 	imagePullTimeout time.Duration,
 	cfg *drivers.TaskConfig,
 ) (string, error) {
 	var imageID string
 	imageName := image
-	// If it is a shortname, we should not have to worry
-	// Let podman deal with it according to user configuration
-	if !shortnames.IsShortName(image) {
+	loadedFromArchive := false
+	// Archive transports (oci-archive/docker-archive) pointing at an http(s)
+	// URL are handled here because the upstream containers/image reference
+	// parsers reject a URL in place of a local path. The archive is streamed
+	// straight to podman's load endpoint without staging it on disk.
+	if archiveURL, ok := archiveTransportURL(image); ok {
+		loadedName, err := d.loadImageFromURL(archiveURL, podmanClient, imagePullTimeout, cfg)
+		if err != nil {
+			return imageID, err
+		}
+		imageName = loadedName
+		loadedFromArchive = true
+	} else if !shortnames.IsShortName(image) {
+		// If it is a shortname, we should not have to worry
+		// Let podman deal with it according to user configuration
 		imageRef, err := parseImage(image)
 		if err != nil {
 			return imageID, fmt.Errorf("invalid image reference %s: %w", image, err)
@@ -1242,17 +1407,12 @@ func (d *Driver) createImage(
 			archiveData := imageRef.StringWithinTransport()
 			path := strings.Split(archiveData, ":")[0]
 			d.logger.Debug("Load image archive", "path", path)
-			_ = d.eventer.EmitEvent(&drivers.TaskEvent{
-				TaskID:    cfg.ID,
-				TaskName:  cfg.Name,
-				AllocID:   cfg.AllocID,
-				Timestamp: time.Now(),
-				Message:   "Loading image " + path,
-			})
+			d.emitImageEvent(cfg, "Loading image "+path)
 			imageName, err = podmanClient.ImageLoad(d.ctx, path)
 			if err != nil {
 				return imageID, fmt.Errorf("error while loading image: %w", err)
 			}
+			loadedFromArchive = true
 		}
 	}
 
@@ -1262,20 +1422,21 @@ func (d *Driver) createImage(
 		// to pull the image instead
 		d.logger.Warn("Unable to check for local image", "image", imageName, "error", err)
 	}
-	if !forcePull && imageID != "" {
+	// The local image lookup above is platform-agnostic: it resolves an image
+	// by name regardless of its OS/architecture. When a platform override is
+	// requested, bypass the cache shortcut and always pull so the correct
+	// variant is fetched (podman skips the download if it is already present).
+	// Images loaded from an archive cannot be pulled from a registry, so the
+	// platform override does not apply to them and the cache shortcut is kept.
+	usePlatform := platform.isSet() && !loadedFromArchive
+	if !forcePull && !usePlatform && imageID != "" {
 		d.logger.Debug("Found imageID", imageID, "for image", imageName, "in local storage")
 		return imageID, nil
 	}
 
 	d.logger.Info("Pulling image", "image", imageName)
 
-	_ = d.eventer.EmitEvent(&drivers.TaskEvent{
-		TaskID:    cfg.ID,
-		TaskName:  cfg.Name,
-		AllocID:   cfg.AllocID,
-		Timestamp: time.Now(),
-		Message:   "Pulling image " + imageName,
-	})
+	d.emitImageEvent(cfg, "Pulling image "+imageName)
 
 	pc := &registry.PullConfig{
 		Image:     imageName,
@@ -1288,8 +1449,24 @@ func (d *Driver) createImage(
 		CredentialsHelper: d.config.Auth.Helper,
 		AuthSoftFail:      authSoftFail,
 	}
+	// Only thread the platform override through for pullable references. For
+	// archive-loaded images these fields are meaningless and the image is
+	// already present locally.
+	if !loadedFromArchive {
+		pc.Arch = platform.arch
+		pc.OS = platform.os
+		pc.Variant = platform.variant
+	}
 
-	result, err, _ := d.pullGroup.Do(imageName, func() (interface{}, error) {
+	// Key the singleflight group on both the image name and the requested
+	// platform so concurrent pulls of the same image for different platforms
+	// are not collapsed into a single result.
+	pullKey := imageName
+	if usePlatform {
+		pullKey = fmt.Sprintf("%s|%s|%s|%s", imageName, platform.os, platform.arch, platform.variant)
+	}
+
+	result, err, _ := d.pullGroup.Do(pullKey, func() (interface{}, error) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), imagePullTimeout)
 		defer cancel()
@@ -1305,6 +1482,89 @@ func (d *Driver) createImage(
 	imageID = result.(string)
 	d.logger.Debug("Pulled image ID", "imageID", imageID)
 	return imageID, nil
+}
+
+// emitImageEvent broadcasts a task event for an image operation (loading or
+// pulling), filling in the task identity fields shared by every such event.
+func (d *Driver) emitImageEvent(cfg *drivers.TaskConfig, message string) {
+	_ = d.eventer.EmitEvent(&drivers.TaskEvent{
+		TaskID:    cfg.ID,
+		TaskName:  cfg.Name,
+		AllocID:   cfg.AllocID,
+		Timestamp: time.Now(),
+		Message:   message,
+	})
+}
+
+// loadImageFromURL downloads an image archive from an http(s) URL and streams
+// it directly to podman's image load endpoint. The download is bounded by
+// imagePullTimeout and the archive is never staged on local disk. It returns
+// the name of the loaded image.
+func (d *Driver) loadImageFromURL(
+	url string,
+	podmanClient *api.API,
+	imagePullTimeout time.Duration,
+	cfg *drivers.TaskConfig,
+) (string, error) {
+	d.logger.Debug("Downloading image archive", "url", url)
+	d.emitImageEvent(cfg, "Loading image "+url)
+
+	ctx, cancel := context.WithTimeout(d.ctx, imagePullTimeout)
+	defer cancel()
+
+	resp, err := d.getImageArchive(ctx, url)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	imageName, err := podmanClient.ImageLoadReader(ctx, resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error while loading image: %w", err)
+	}
+
+	return imageName, nil
+}
+
+// getImageArchive issues the GET request for an image archive using the
+// driver's http client and returns the response on success. It encapsulates the
+// request boilerplate (building the request, performing it, and validating the
+// status) so the load logic stays separate from the transport concerns. The
+// caller is responsible for closing the response body.
+func (d *Driver) getImageArchive(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request for image archive %s: %w", url, err)
+	}
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download image archive %s: %w", url, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("failed to download image archive %s: unexpected status %s", url, resp.Status)
+	}
+
+	return resp, nil
+}
+
+// archiveTransportURL detects an oci-archive or docker-archive image reference
+// whose archive is located at an http(s) URL, e.g.
+// "oci-archive:http://host:9999/image.tar". The upstream containers/image
+// reference parsers cannot handle a URL in place of a local path, so these
+// references must be intercepted before parseImage. It returns the URL and true
+// when the reference matches, and "", false otherwise.
+func archiveTransportURL(image string) (string, bool) {
+	for _, transport := range []string{"oci-archive:", "docker-archive:"} {
+		if rest, ok := strings.CutPrefix(image, transport); ok {
+			if strings.HasPrefix(rest, "http://") || strings.HasPrefix(rest, "https://") {
+				return rest, true
+			}
+		}
+	}
+	return "", false
 }
 
 func parseImage(image string) (types.ImageReference, error) {
@@ -1904,29 +2164,32 @@ func parseUserNSConfig(userNSConfig string) (api.Namespace, *api.IDMappingOption
 	modeWithConfig := strings.SplitN(userNSConfig, ":", 2)
 	mode := api.NamespaceMode(modeWithConfig[0])
 
-	if len(modeWithConfig) == 1 {
-		// if there's no additional configuration, we can bail out early
-		return api.Namespace{NSMode: mode}, nil, nil
+	var config string
+	if len(modeWithConfig) == 2 {
+		config = modeWithConfig[1]
 	}
 
-	config := modeWithConfig[1]
 	ns := api.Namespace{NSMode: mode, Value: config}
 
 	switch mode {
 	case "", "host":
 		return ns, nil, nil
 	case "auto":
-		autoOpts := strings.Split(config, ",")
 		mappings := &api.IDMappingOptions{
 			UIDMap:         []api.IDMap{},
 			GIDMap:         []api.IDMap{},
 			AutoUserNs:     true,
 			AutoUserNsOpts: api.AutoUserNsOptions{},
 		}
+		if config == "" {
+			return ns, mappings, nil
+		}
+
+		autoOpts := strings.Split(config, ",")
 		for _, opt := range autoOpts {
-			kv := strings.Split(opt, "=")
+			kv := strings.SplitN(opt, "=", 2)
 			if len(kv) != 2 {
-				return ns, nil, fmt.Errorf("invalid userns configuration: %q", kv)
+				return ns, nil, fmt.Errorf("invalid userns configuration: %q", opt)
 			}
 			switch kv[0] {
 			case "gidmapping":
@@ -1941,7 +2204,7 @@ func parseUserNSConfig(userNSConfig string) (api.Namespace, *api.IDMappingOption
 			case "size":
 				sz, err := strconv.ParseUint(kv[1], 10, 32)
 				if err != nil {
-					return ns, nil, err
+					return ns, nil, fmt.Errorf("invalid userns size %q: %w", kv[1], err)
 				}
 				mappings.AutoUserNsOpts.Size = uint32(sz)
 			case "uidmapping":
@@ -1953,6 +2216,8 @@ func parseUserNSConfig(userNSConfig string) (api.Namespace, *api.IDMappingOption
 				mappings.UIDMap = append(mappings.UIDMap, *idMap)
 				mappings.AutoUserNsOpts.AdditionalUIDMappings = append(
 					mappings.AutoUserNsOpts.AdditionalUIDMappings, *idMap)
+			default:
+				return ns, nil, fmt.Errorf("invalid userns auto option %q", kv[0])
 			}
 		}
 
@@ -1994,6 +2259,105 @@ func parseIDMapping(idmapConfig string) (*api.IDMap, error) {
 		HostID:      int(hostID),
 		Size:        int(sz),
 	}, nil
+}
+
+// resolveContainerIP determines the container's IP address from inspect data.
+// For the default bridge network, Podman populates the top-level IPAddress field.
+// For named networks it is empty and the IP lives in the per-network map instead.
+func resolveContainerIP(networkSettings *api.InspectNetworkSettings, networkName string) string {
+	if networkSettings == nil {
+		return ""
+	}
+	if networkSettings.IPAddress != "" {
+		return networkSettings.IPAddress
+	}
+	if netData, ok := networkSettings.Networks[networkName]; ok {
+		if netData.IPAddress != "" {
+			return netData.IPAddress
+		}
+		// IPv6-only network: no IPv4 address is assigned, so fall back to the
+		// global IPv6 address.
+		return netData.GlobalIPv6Address
+	}
+	// IPv6-only default network: same fallback for the top-level settings.
+	return networkSettings.GlobalIPv6Address
+}
+
+// ensureFifoAccessible ensures the log FIFO at fifoPath can be written to by
+// the rootless podman user. It determines the podman user by stat-ing the unix
+// socket file and chowns the FIFO to that user. No-op when podman is running
+// as root or when the socket owner cannot be determined (e.g. TCP socket).
+//
+// Uses os.Root to open the FIFO without following symlinks, preventing a
+// symlink swap attack where a restarted task replaces the FIFO with a symlink
+// to an arbitrary file.
+func ensureFifoAccessible(logger hclog.Logger, fifoPath string, podmanClient *api.API) error {
+	// Nothing to do if log collection is disabled (no FIFO path configured).
+	if fifoPath == "" {
+		return nil
+	}
+	// Rootful podman: conmon runs as root and can already write to the
+	// root-owned FIFO, so no ownership change is needed.
+	if !podmanClient.IsRootless() {
+		return nil
+	}
+
+	uid, gid, ok := getSocketOwner(podmanClient.GetSocketPath())
+
+	if ok {
+		// Open the FIFO's parent directory as a root to prevent symlink traversal.
+		dir := filepath.Dir(fifoPath)
+		base := filepath.Base(fifoPath)
+
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return fmt.Errorf("failed to open fifo parent directory %q: %w", dir, err)
+		}
+		defer root.Close()
+
+		// Open the FIFO itself without following symlinks (os.Root enforces this).
+		// O_RDONLY|O_NONBLOCK avoids blocking on the FIFO (no writer needed).
+		// We only need a valid fd for fchown, not actual I/O.
+		f, err := root.OpenFile(base, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return fmt.Errorf("failed to open fifo %q: %w", fifoPath, err)
+		}
+		defer f.Close()
+
+		// Fchown on the file descriptor — safe from TOCTOU/symlink attacks.
+		if err := f.Chown(uid, gid); err != nil {
+			return err
+		}
+	} else {
+		// Cannot determine socket owner (TCP/HTTP socket or stat failed) — skip.
+		// Rootless podman over non-unix sockets is unsupported for log FIFOs.
+		logger.Debug("cannot determine podman socket owner, skipping fifo chown", "path", fifoPath)
+	}
+
+	return nil
+}
+
+// getSocketOwner returns the UID/GID of a unix socket file.
+// Returns 0, 0, false if the owner cannot be determined.
+func getSocketOwner(socketPath string) (int, int, bool) {
+	if !strings.HasPrefix(socketPath, "unix:") {
+		return 0, 0, false
+	}
+	// Two TrimPrefix calls handle both forms of the unix socket URI:
+	// "unix:/run/user/1001/podman/podman.sock"   → strip "unix:"
+	// "unix:///run/user/1001/podman/podman.sock"  → strip "unix:" then "//"
+	sockFile := strings.TrimPrefix(socketPath, "unix:")
+	sockFile = strings.TrimPrefix(sockFile, "//")
+
+	info, err := os.Stat(sockFile)
+	if err != nil {
+		return 0, 0, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return int(stat.Uid), int(stat.Gid), true
 }
 
 func (d *Driver) CreateNetwork(allocID string, createSpec *drivers.NetworkCreateRequest) (*drivers.NetworkIsolationSpec, bool, error) {

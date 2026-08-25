@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2019, 2025
+// Copyright IBM Corp. 2019, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package registry
@@ -18,6 +18,12 @@ type PullConfig struct {
 	CredentialsFile   string
 	CredentialsHelper string
 	AuthSoftFail      bool
+	// Arch, OS and Variant override the architecture, operating system and
+	// variant of the image to pull. When empty, the host defaults are used.
+	// These map to podman's --arch, --os and --variant pull flags.
+	Arch    string
+	OS      string
+	Variant string
 }
 
 // BasicConfig returns the Basic-Auth level of configuration.
@@ -87,6 +93,9 @@ func (pc *PullConfig) Log(logger hclog.Logger) {
 		"token", token,
 		"helper", helper,
 		"file", file,
+		"arch", pc.Arch,
+		"os", pc.OS,
+		"variant", pc.Variant,
 	)
 }
 

@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2019, 2025
+// Copyright IBM Corp. 2019, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package api
@@ -438,7 +438,7 @@ type ContainerNetworkConfig struct {
 	// for this container on the specific network. If the map is empty and the
 	// bridge network mode is set the container will be joined to the default
 	// network.
-	Networks map[string]PerNetworkOptions `json:"newNetworks,omitempty"`
+	Networks map[string]PerNetworkOptions `json:"Networks,omitempty"`
 }
 
 // ContainerResourceConfig contains information on container resource limits.
@@ -559,6 +559,9 @@ const (
 	FromPod NamespaceMode = "pod"
 	// Private indicates the namespace is private
 	Private NamespaceMode = "private"
+	// Shareable indicates the IPC namespace is private but can be shared
+	// with other containers (e.g. via --ipc=container:<id>)
+	Shareable NamespaceMode = "shareable"
 	// NoNetwork indicates no network namespace should
 	// be joined.  loopback should still exists
 	NoNetwork NamespaceMode = "none"

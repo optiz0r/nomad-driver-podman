@@ -224,11 +224,18 @@ plugin "nomad-driver-podman" {
 
 ## Task Configuration
 
-* **image** - The image to run. Accepted transports are `docker` (default if missing), `oci-archive` and `docker-archive`. Images reference as [short-names](https://github.com/containers/image/blob/master/docs/containers-registries.conf.5.md#short-name-aliasing) will be treated according to user-configured preferences.
+* **image** - The image to run. Accepted transports are `docker` (default if missing), `oci-archive` and `docker-archive`. Images reference as [short-names](https://github.com/containers/image/blob/master/docs/containers-registries.conf.5.md#short-name-aliasing) will be treated according to user-configured preferences. The `oci-archive` and `docker-archive` transports also accept an `http(s)://` URL; the archive is downloaded (bounded by `image_pull_timeout`) and loaded into Podman.
 
 ```hcl
 config {
   image = "docker://redis"
+}
+```
+
+```hcl
+config {
+  # Load an image archive served over HTTP.
+  image = "oci-archive:https://example.com/images/redis.tar"
 }
 ```
 
@@ -419,6 +426,9 @@ By default the task uses the network stack defined in the task group, see [netwo
   it for root containers [issue](https://github.com/containers/libpod/issues/6097).
 * `container:id`: reuse another podman containers network stack
 * `task:name-of-other-task`: join the network of another task in the same allocation.
+* `custom-network-name`: attach the container to a pre-existing Podman network
+  created with `podman network create`. The network must already exist or the task
+  will fail with a clear error. Requires Podman >= 4.0.
 
 ```hcl
 config {
@@ -524,6 +534,41 @@ config {
 }
 ```
 
+* **arch** / **os** / **variant** - (Optional) Override the architecture, operating
+  system and variant of the image to pull. These map to podman's `--arch`, `--os`
+  and `--variant` pull flags. When unset, the host platform defaults are used.
+  This is mainly useful for pulling Linux images on a FreeBSD host, or for pulling
+  a non-native architecture image on a host with emulation configured.
+
+```hcl
+config {
+  image = "docker.io/nginx:latest"
+  os    = "linux"
+  arch  = "amd64"
+}
+```
+
+  When any of these are set, the driver always pulls the image (the local image
+  cache lookup is platform-agnostic), so the correct variant is fetched. podman
+  skips the download if the matching image is already present.
+
+  Nomad servers treat the task config as an opaque blob and cannot validate these
+  overrides at scheduling time. If a target node cannot run the requested platform,
+  use [`constraint`](https://developer.hashicorp.com/nomad/docs/job-specification/constraint)
+  blocks to pin the workload to compatible nodes, for example:
+
+```hcl
+constraint {
+  attribute = "${attr.kernel.name}"
+  value     = "freebsd"
+}
+
+config {
+  image = "docker.io/nginx:latest"
+  os    = "linux"
+}
+```
+
 * **readonly_rootfs** - (Optional)  true or false (default). Mount the rootfs as read-only.
 
 ```hcl
@@ -546,7 +591,42 @@ config {
 
 ```hcl
 config {
+  userns = "auto"
+}
+```
+
+```hcl
+config {
+  userns = "auto:size=65536"
+}
+```
+
+```hcl
+config {
   userns = "keep-id:uid=200,gid=210"
+}
+```
+
+* **ipc_mode** - (Optional) Set the [IPC namespace mode](https://docs.podman.io/en/latest/markdown/podman-run.1.html#ipc-ipc) for the container. When unset, Podman uses its default (a `private` IPC namespace).
+
+* `host`: use the host's IPC namespace. Note: this gives the container access to
+  host IPC primitives and is therefore considered insecure.
+* `private`: create a private IPC namespace (the default).
+* `shareable`: create a private IPC namespace that other containers may join.
+* `none`: create a private IPC namespace without mounting `/dev/shm`.
+* `container:id`: join the IPC namespace of another podman container.
+* `ns:path`: join the IPC namespace at the given path.
+* `task:name-of-other-task`: join the IPC namespace of another task in the same
+  allocation. This is useful for sharing `/dev/shm` between tasks, for example
+  with the NVIDIA Multi-Process Service (MPS) for GPU sharing.
+
+`ipc_mode` cannot be combined with `shm_size` unless it is set to
+`private` or `shareable`, since the other modes do not own the container's
+`/dev/shm`.
+
+```hcl
+config {
+  ipc_mode = "task:mps-daemon"
 }
 ```
 

@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2019, 2025
+// Copyright IBM Corp. 2019, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package api
@@ -20,15 +20,15 @@ func (c *API) ContainerLogs(ctx context.Context, name string, since time.Time, s
 	if err != nil {
 		return err
 	}
+	defer func() {
+		ignoreClose(res.Body)
+		c.logger.Debug("Stopped log stream", "container", name)
+	}()
 
 	if res.StatusCode != http.StatusOK {
 		return fmt.Errorf("cannot get logs from container, status code: %d", res.StatusCode)
 	}
 
-	defer func() {
-		ignoreClose(res.Body)
-		c.logger.Debug("Stopped log stream", "container", name)
-	}()
 	buffer := make([]byte, 1024)
 	for {
 		fd, l, err := DemuxHeader(res.Body, buffer)

@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2019, 2025
+// Copyright IBM Corp. 2019, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package main
@@ -7,14 +7,13 @@ import (
 	"testing"
 
 	"github.com/hashicorp/nomad-driver-podman/ci"
-	"github.com/hashicorp/nomad/helper/pluginutils/hclutils"
 	"github.com/shoenig/test/must"
 )
 
 func TestConfig_Ports(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	expectedPorts := []string{"redis"}
 	validHCL := `
   config {
@@ -31,7 +30,7 @@ func TestConfig_Ports(t *testing.T) {
 func TestConfig_Logging(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	expectedDriver := "journald"
 	expectedTag := "redis"
 	validHCL := `
@@ -57,7 +56,7 @@ func TestConfig_Logging(t *testing.T) {
 func TestConfig_Labels(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	validHCL := `
   config {
 	  image = "docker://redis"
@@ -75,7 +74,7 @@ func TestConfig_Labels(t *testing.T) {
 func TestConfig_ForcePull(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	validHCL := `
   config {
 		image = "docker://redis"
@@ -88,10 +87,30 @@ func TestConfig_ForcePull(t *testing.T) {
 	must.Eq(t, true, tc.ForcePull)
 }
 
+func TestConfig_Platform(t *testing.T) {
+	ci.Parallel(t)
+
+	parser := newConfigParser(taskConfigSpec)
+	validHCL := `
+  config {
+		image = "docker://nginx"
+		os = "linux"
+		arch = "amd64"
+		variant = "v8"
+  }
+`
+
+	var tc *TaskConfig
+	parser.ParseHCL(t, validHCL, &tc)
+	must.Eq(t, "linux", tc.OS)
+	must.Eq(t, "amd64", tc.Arch)
+	must.Eq(t, "v8", tc.Variant)
+}
+
 func TestConfig_CPUHardLimit(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	validHCL := `
   config {
 		image = "docker://redis"
@@ -109,7 +128,7 @@ func TestConfig_CPUHardLimit(t *testing.T) {
 func TestConfig_ImagePullTimeout(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	validHCL := `
   config {
 		image = "docker://redis"
@@ -125,7 +144,7 @@ func TestConfig_ImagePullTimeout(t *testing.T) {
 func TestConfig_ExtraHosts(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	validHCL := `
 		config {
 		image = "docker://redis"
@@ -141,7 +160,7 @@ func TestConfig_ExtraHosts(t *testing.T) {
 func TestConfig_PodmanSocketDefaultIfNotGiven(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	validHCL := `
 	config {
 		image = "docker://redis"
@@ -156,7 +175,7 @@ func TestConfig_PodmanSocketDefaultIfNotGiven(t *testing.T) {
 func TestConfig_PodmanOOMScoreAdj(t *testing.T) {
 	ci.Parallel(t)
 
-	parser := hclutils.NewConfigParser(taskConfigSpec)
+	parser := newConfigParser(taskConfigSpec)
 	validHCL := `
 	config {
 		image = "docker://redis"
@@ -167,4 +186,95 @@ func TestConfig_PodmanOOMScoreAdj(t *testing.T) {
 	var tc *TaskConfig
 	parser.ParseHCL(t, validHCL, &tc)
 	must.Eq(t, "default", tc.Socket)
+}
+
+func TestConfig_IPCMode(t *testing.T) {
+	ci.Parallel(t)
+
+	parser := newConfigParser(taskConfigSpec)
+	validHCL := `
+	config {
+		image = "docker://redis"
+		ipc_mode = "host"
+	}
+	`
+
+	var tc *TaskConfig
+	parser.ParseHCL(t, validHCL, &tc)
+	must.Eq(t, "host", tc.IPCMode)
+}
+
+func TestPluginConfig_Parsing(t *testing.T) {
+	ci.Parallel(t)
+
+	parser := newConfigParser(configSpec)
+	validHCL := `config {
+
+  socket {
+    name        = "default"
+    socket_path = "unix:///run/user/1000/podman/podman.sock"
+  }
+
+  auth {
+    config = "/etc/podman-auth.json"
+	helper = "ecr-login"
+  }
+
+  gc {
+    container = false
+  }
+
+  recover_stopped        = true
+  extra_labels           = ["nomadproject.io:foo"]
+  disable_log_collection = true
+  client_http_timeout    = "2m"
+  dns_servers            = ["9.9.9.9"]
+
+  logging {
+    driver = "journald"
+    options {
+      tag="{{.ImageName}}"
+    }
+  }
+
+  networking {
+    default_rootless_mode = "slirp4netns"
+  }
+
+  volumes {
+    selinuxlabel = "z"
+  }
+}
+	`
+
+	var pc *PluginConfig
+	parser.ParseHCL(t, validHCL, &pc)
+	must.Eq(t, pc, &PluginConfig{
+		Auth: PluginAuthConfig{
+			FileConfig: "/etc/podman-auth.json",
+			Helper:     "ecr-login",
+		},
+		Volumes: VolumeConfig{
+			Enabled:      true,
+			SelinuxLabel: "z",
+		},
+		GC:                   GCConfig{},
+		RecoverStopped:       true,
+		DisableLogCollection: true,
+		Socket: []PluginSocketConfig{{
+			Name:       "default",
+			SocketPath: "unix:///run/user/1000/podman/podman.sock",
+		}},
+		SocketPath:        "",
+		ClientHttpTimeout: "2m",
+		ExtraLabels:       []string{"nomadproject.io:foo"},
+		DNSServers:        []string{"9.9.9.9"},
+		Logging: LoggingConfig{
+			Driver: "journald",
+			Options: map[string]string{
+				"tag": "{{.ImageName}}",
+			},
+		},
+		Networking: NetworkingConfig{DefaultRootlessMode: "slirp4netns"},
+	})
 }
